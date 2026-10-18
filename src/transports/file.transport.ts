@@ -1,0 +1,351 @@
+import type { WriteStream } from 'node:fs';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { promisify } from 'node:util';
+import { createGzip } from 'node:zlib';
+
+import type {
+  FileTransportConfig,
+  IBatchTransport,
+  ITransport,
+  TransportLogEntry,
+} from '../types/transport.types';
+import { safeToString } from '../utils/coerce.utils';
+import { internalError } from '../utils/internal-log';
+
+const writeFile = promisify(fs.writeFile);
+const mkdir = promisify(fs.mkdir);
+const unlink = promisify(fs.unlink);
+const readdir = promisify(fs.readdir);
+const stat = promisify(fs.stat);
+
+/**
+ * Appends log entries to a local file with automatic rotation.
+ *
+ * Supports batched writes, size-based and date-based rotation, and optional
+ * gzip compression of rotated files.
+ *
+ * @example
+ * transports: { file: { filename: 'app.log', dirname: './logs', maxSize: '50MB' } }
+ */
+export class FileTransport implements ITransport, IBatchTransport {
+  public readonly name = 'file';
+  public readonly level?: string | undefined;
+  public readonly batchSize?: number;
+  public readonly flushInterval?: number;
+  public readonly filter?: (entry: TransportLogEntry) => boolean;
+
+  private readonly config: FileTransportConfig;
+  private writeStream: WriteStream | undefined;
+  private batch: TransportLogEntry[] = [];
+  private batchTimer?: NodeJS.Timeout | undefined;
+  private lastRotation: Date = new Date();
+  private currentFilePath: string;
+  /** Guards against concurrent rotation — two simultaneous writes both seeing shouldRotateNow(). */
+  private isRotating = false;
+  /**
+   * The in-flight drain promise, or undefined when idle. Concurrent flush() calls
+   * (e.g. the un-awaited flush addToBatch fires on every Nth entry) all await this
+   * single promise instead of starting their own drain, so the batch is never
+   * snapshotted and written twice.
+   */
+  private flushPromise: Promise<void> | undefined;
+
+  constructor(config: FileTransportConfig) {
+    this.config = {
+      format: 'json',
+      batchSize: 100,
+      flushInterval: 5000,
+      ...config,
+    };
+    this.level = config.level;
+    this.batchSize = this.config.batchSize || 100;
+    this.flushInterval = this.config.flushInterval || 5000;
+    if (config.filter) this.filter = config.filter;
+    this.currentFilePath = this.generateFilePath();
+    this.ensureDirectoryExists();
+  }
+
+  async write(entry: TransportLogEntry): Promise<void> {
+    try {
+      if (this.shouldRotateNow() && !this.isRotating) {
+        this.isRotating = true;
+        try {
+          await this.rotate();
+        } finally {
+          this.isRotating = false;
+        }
+      }
+
+      if (this.config.batchSize && this.config.batchSize > 1) {
+        this.addToBatch(entry);
+      } else {
+        await this.writeBatch([entry]);
+      }
+    } catch (error) {
+      throw new Error(`File transport write failed: ${(error as Error).message}`, { cause: error });
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = undefined;
+    }
+
+    // Serialize concurrent flushes. addToBatch() calls flush() un-awaited on every
+    // Nth entry, so a synchronous burst of writes can fire many overlapping flushes.
+    // Every caller (awaited or not) joins the SAME in-flight drain, so the batch is
+    // never snapshotted twice — which previously turned N log calls into N² file
+    // lines (the batch-flush duplication bug). Callers that await flush() still see
+    // the batch fully drained because they await the shared drain promise.
+    if (!this.flushPromise) {
+      this.flushPromise = this.drain().finally(() => {
+        this.flushPromise = undefined;
+      });
+    }
+
+    await this.flushPromise;
+  }
+
+  /**
+   * Drains the batch to disk one snapshot at a time. Entries appended while a
+   * write is in flight are picked up by the next loop iteration, so a single
+   * drain() empties the batch completely regardless of concurrent writes.
+   */
+  private async drain(): Promise<void> {
+    while (this.batch.length > 0) {
+      // Detach the current batch SYNCHRONOUSLY before awaiting, so entries pushed
+      // during the write land in a fresh array and are never re-written.
+      const pending = this.batch;
+      this.batch = [];
+      await this.writeBatch(pending);
+    }
+  }
+
+  private formatEntry(entry: TransportLogEntry): string {
+    switch (this.config.format) {
+      case 'json':
+        return JSON.stringify({
+          timestamp: entry.timestamp.toISOString(),
+          level: entry.level,
+          message: entry.message,
+          ...(entry.data || {}),
+        });
+
+      case 'csv': {
+        const safeMessage = safeToString(entry.message);
+        const fields = [
+          entry.timestamp.toISOString(),
+          entry.level,
+          `"${safeMessage.replace(/"/g, '""')}"`,
+          safeToString(entry.context),
+          safeToString(entry.traceId),
+          JSON.stringify(entry.data || {}),
+        ];
+        return fields.join(',');
+      }
+
+      case 'text':
+      default:
+        return `${entry.timestamp.toISOString()} [${entry.level.toUpperCase()}] ${safeToString(entry.message)}${entry.data ? ' ' + JSON.stringify(entry.data) : ''}`;
+    }
+  }
+
+  addToBatch(entry: TransportLogEntry): void {
+    this.batch.push(entry);
+
+    if (this.batch.length >= (this.config.batchSize || 100)) {
+      // Cancel any pending interval flush — the threshold flush supersedes it, and
+      // a leftover timer would fire a redundant flush after the batch is already gone.
+      if (this.batchTimer) {
+        clearTimeout(this.batchTimer);
+        this.batchTimer = undefined;
+      }
+      this.flush().catch((err: unknown) => internalError('FileTransport batch flush failed', err));
+    } else if (!this.batchTimer && this.config.flushInterval) {
+      this.batchTimer = setTimeout(() => {
+        this.flush().catch((err: unknown) =>
+          internalError('FileTransport interval flush failed', err)
+        );
+      }, this.config.flushInterval);
+    }
+  }
+
+  private async writeBatch(entries: TransportLogEntry[]): Promise<void> {
+    if (entries.length === 0) return;
+
+    const content = entries.map((entry) => this.formatEntry(entry)).join('\n') + '\n';
+
+    if (this.writeStream) {
+      return new Promise((resolve, reject) => {
+        this.writeStream!.write(content, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    } else {
+      await writeFile(this.currentFilePath, content, { flag: 'a' });
+    }
+  }
+
+  private shouldRotateNow(): boolean {
+    if (!this.config.rotation?.interval) return false;
+
+    const now = new Date();
+    const timeDiff = now.getTime() - this.lastRotation.getTime();
+    const rotationInterval = this.parseInterval(this.config.rotation.interval);
+
+    return timeDiff >= rotationInterval;
+  }
+
+  private parseInterval(interval: string): number {
+    // eslint-disable-next-line sonarjs/super-linear-regex -- simple bounded pattern for interval parsing
+    const match = new RegExp(/(\d+)([hdwmy])/i).exec(interval);
+    if (!match) return 24 * 60 * 60 * 1000; // Default 1 day
+
+    const value = Number.parseInt(match[1] || '1', 10);
+    const unit = (match[2] || 'h').toLowerCase();
+
+    switch (unit) {
+      case 'h':
+        return value * 60 * 60 * 1000;
+      case 'd':
+        return value * 24 * 60 * 60 * 1000;
+      case 'w':
+        return value * 7 * 24 * 60 * 60 * 1000;
+      case 'm':
+        return value * 30 * 24 * 60 * 60 * 1000;
+      case 'y':
+        return value * 365 * 24 * 60 * 60 * 1000;
+      default:
+        return value * 60 * 60 * 1000;
+    }
+  }
+
+  private async rotate(): Promise<void> {
+    await this.flush();
+
+    if (this.writeStream) {
+      await new Promise<void>((resolve) => {
+        this.writeStream!.end(() => resolve());
+      });
+      this.writeStream = undefined;
+    }
+
+    const oldPath = this.currentFilePath;
+    this.currentFilePath = this.generateFilePath();
+    this.lastRotation = new Date();
+
+    // Compress old file if configured
+    if (this.config.rotation?.compress) {
+      await this.compressFile(oldPath);
+    }
+
+    // Clean up old files
+    if (this.config.rotation?.maxFiles) {
+      await this.cleanupOldFiles();
+    }
+  }
+
+  private resolveDir(): string {
+    // If dirname is provided, use it; otherwise fall back to the directory part of filename
+    if (this.config.dirname) {
+      return this.config.dirname;
+    }
+    const fromFilename = path.dirname(this.config.filename);
+    // path.dirname returns '.' for bare filenames like 'app.log' — use CWD in that case
+    return fromFilename === '.' ? process.cwd() : fromFilename;
+  }
+
+  private generateFilePath(): string {
+    const now = new Date();
+    const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const dir = this.resolveDir();
+    const ext = path.extname(this.config.filename);
+    const base = path.basename(this.config.filename, ext);
+
+    if (this.config.rotation) {
+      return path.join(dir, `${base}-${timestamp}${ext}`);
+    }
+
+    return path.join(dir, `${base}${ext}`);
+  }
+
+  private async ensureDirectoryExists(): Promise<void> {
+    const dir = this.resolveDir();
+    try {
+      await mkdir(dir, { recursive: true });
+    } catch {
+      // Directory might already exist
+    }
+  }
+
+  /**
+   * Gzip the rotated file to `<file>.gz` and remove the original. Streams the
+   * data so large log files don't have to be buffered in memory. Best-effort:
+   * any failure is logged and leaves the original file intact rather than
+   * throwing out of the rotation path.
+   */
+  private async compressFile(filePath: string): Promise<void> {
+    const gzPath = `${filePath}.gz`;
+    try {
+      await pipeline(fs.createReadStream(filePath), createGzip(), fs.createWriteStream(gzPath));
+      // Only delete the source once the compressed copy is fully written.
+      await unlink(filePath);
+    } catch (error) {
+      internalError('Failed to compress rotated log file', error);
+      // Clean up a partial .gz so a later cleanup pass doesn't keep a corrupt file.
+      try {
+        await unlink(gzPath);
+      } catch {
+        /* nothing to clean up */
+      }
+    }
+  }
+
+  private async cleanupOldFiles(): Promise<void> {
+    if (!this.config.rotation?.maxFiles) return;
+
+    try {
+      const dir = this.resolveDir();
+      const files = await readdir(dir);
+      const ext = path.extname(this.config.filename);
+      const base = path.basename(this.config.filename, ext);
+
+      // Match ONLY this transport's own rotated files: `${base}-<timestamp>${ext}`
+      // (optionally `.gz`). A loose `startsWith(base)` would also match unrelated
+      // files like `application.log` when base is `app`, and could delete them.
+      const isOwnRotatedFile = (file: string): boolean =>
+        file.startsWith(`${base}-`) && (file.endsWith(ext) || file.endsWith(`${ext}.gz`));
+
+      const logFiles = files.filter(isOwnRotatedFile).map(async (file) => {
+        const filePath = path.join(dir, file);
+        const stats = await stat(filePath);
+        return { path: filePath, mtime: stats.mtime };
+      });
+
+      const fileStats = await Promise.all(logFiles);
+      const sortedFiles = fileStats.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+
+      const filesToDelete = sortedFiles.slice(this.config.rotation.maxFiles);
+
+      for (const file of filesToDelete) {
+        await unlink(file.path);
+      }
+    } catch (error) {
+      internalError('Failed to cleanup old log files', error);
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.flush();
+
+    if (this.writeStream) {
+      return new Promise((resolve) => {
+        this.writeStream!.end(() => resolve());
+      });
+    }
+  }
+}

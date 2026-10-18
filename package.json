@@ -1,0 +1,386 @@
+{
+  "name": "logixia",
+  "version": "1.12.0",
+  "description": "Async-first TypeScript logger: wide events / canonical log lines, OTLP OpenTelemetry export, runtime log levels, redaction, adaptive sampling, NestJS, multi-transport (file, DB, cloud), tracing & log search. A fast Winston/Pino alternative.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "default": "./dist/index.js"
+    },
+    "./nest": {
+      "import": {
+        "types": "./dist/nest.d.mts",
+        "default": "./dist/nest.mjs"
+      },
+      "require": {
+        "types": "./dist/nest.d.ts",
+        "default": "./dist/nest.js"
+      }
+    },
+    "./transports": {
+      "import": {
+        "types": "./dist/transports.d.mts",
+        "default": "./dist/transports.mjs"
+      },
+      "require": {
+        "types": "./dist/transports.d.ts",
+        "default": "./dist/transports.js"
+      }
+    },
+    "./search": {
+      "import": {
+        "types": "./dist/search.d.mts",
+        "default": "./dist/search.mjs"
+      },
+      "require": {
+        "types": "./dist/search.d.ts",
+        "default": "./dist/search.js"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.mts",
+        "default": "./dist/testing.mjs"
+      },
+      "require": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
+      }
+    },
+    "./middleware": {
+      "import": {
+        "types": "./dist/middleware.d.mts",
+        "default": "./dist/middleware.mjs"
+      },
+      "require": {
+        "types": "./dist/middleware.d.ts",
+        "default": "./dist/middleware.js"
+      }
+    },
+    "./worker": {
+      "import": {
+        "types": "./dist/transports/worker.transport.d.mts",
+        "default": "./dist/transports/worker.transport.mjs"
+      },
+      "require": {
+        "types": "./dist/transports/worker.transport.d.ts",
+        "default": "./dist/transports/worker.transport.js"
+      }
+    },
+    "./cloudwatch": {
+      "import": {
+        "types": "./dist/transports/cloudwatch.transport.d.mts",
+        "default": "./dist/transports/cloudwatch.transport.mjs"
+      },
+      "require": {
+        "types": "./dist/transports/cloudwatch.transport.d.ts",
+        "default": "./dist/transports/cloudwatch.transport.js"
+      }
+    },
+    "./gcp": {
+      "import": {
+        "types": "./dist/transports/gcp.transport.d.mts",
+        "default": "./dist/transports/gcp.transport.mjs"
+      },
+      "require": {
+        "types": "./dist/transports/gcp.transport.d.ts",
+        "default": "./dist/transports/gcp.transport.js"
+      }
+    },
+    "./azure": {
+      "import": {
+        "types": "./dist/transports/azure-monitor.transport.d.mts",
+        "default": "./dist/transports/azure-monitor.transport.mjs"
+      },
+      "require": {
+        "types": "./dist/transports/azure-monitor.transport.d.ts",
+        "default": "./dist/transports/azure-monitor.transport.js"
+      }
+    },
+    "./browser": {
+      "import": {
+        "types": "./dist/browser.d.mts",
+        "default": "./dist/browser.mjs"
+      },
+      "require": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      }
+    },
+    "./correlation": {
+      "import": {
+        "types": "./dist/correlation.d.mts",
+        "default": "./dist/correlation.mjs"
+      },
+      "require": {
+        "types": "./dist/correlation.d.ts",
+        "default": "./dist/correlation.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "scripts/postinstall.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsdown",
+    "cli:dev": "ts-node src/cli/index.ts",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:ci": "jest --coverage --ci --bail --forceExit",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "lint:check": "eslint src/",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run lint:check",
+    "ci": "npm run typecheck && npm run lint:check && npm run test:ci",
+    "validate": "npm run clean && npm run build && npm run typecheck && npm run lint:check && npm run test:coverage",
+    "prepublishOnly": "npm run validate",
+    "dev:basic-usage": "ts-node examples/basic-usage.ts",
+    "dev:express": "ts-node examples/express-example.ts",
+    "dev:nestjs": "ts-node examples/nestjs-example.ts",
+    "dev:nestjs-app": "ts-node --project examples/nestjs-app/tsconfig.json -r ./examples/nestjs-app/register.js examples/nestjs-app/src/main.ts",
+    "dev:custom-levels": "ts-node examples/custom-levels.ts",
+    "dev:performance": "ts-node examples/performance-monitoring.ts",
+    "dev:fields": "ts-node examples/field-configuration.ts",
+    "dev:search": "ts-node examples/search-quickstart.ts",
+    "dev:intelligent-search": "ts-node examples/intelligent-search.ts",
+    "benchmark": "npm run build && node benchmarks/run.mjs",
+    "size": "size-limit",
+    "postinstall": "node scripts/postinstall.js",
+    "prepare": "node -e \"if(process.env.HUSKY!=='0'&&process.env.CI!=='true'){try{require('child_process').execSync('husky install',{stdio:'inherit'})}catch(e){process.exit(0)}}\"",
+    "benchmark:features": "npm run build && node benchmarks/features.mjs"
+  },
+  "keywords": [
+    "logger",
+    "logging",
+    "typescript",
+    "typescript-logger",
+    "nestjs",
+    "nestjs-logger",
+    "nestjs-logging",
+    "nestjs-module",
+    "winston-alternative",
+    "pino-alternative",
+    "structured-logging",
+    "json-logging",
+    "custom-log-levels",
+    "log-levels",
+    "request-tracing",
+    "trace-id",
+    "opentelemetry",
+    "w3c-trace-context",
+    "multi-transport",
+    "console-transport",
+    "file-transport",
+    "log-rotation",
+    "database-logging",
+    "mongodb-logger",
+    "postgresql-logger",
+    "analytics-logging",
+    "datadog",
+    "mixpanel",
+    "segment",
+    "log-search",
+    "log-analysis",
+    "log-aggregation",
+    "nodejs",
+    "bun",
+    "express",
+    "microservices",
+    "distributed-tracing",
+    "observability",
+    "developer-tools",
+    "enterprise-logging",
+    "wide-events",
+    "canonical-log-lines",
+    "observability-2.0",
+    "otlp",
+    "otlp-logs",
+    "opentelemetry-logs",
+    "otel-logs",
+    "log-correlation",
+    "trace-log-correlation",
+    "log-redaction",
+    "pii-redaction",
+    "secret-redaction",
+    "log-sampling",
+    "adaptive-sampling",
+    "dynamic-log-level",
+    "runtime-log-level",
+    "prometheus",
+    "metrics",
+    "prometheus-metrics",
+    "graceful-shutdown",
+    "flush-on-exit",
+    "cloudwatch",
+    "gcp-logging",
+    "azure-monitor",
+    "fastify",
+    "fastify-logger",
+    "fastify-logging",
+    "browser-logger",
+    "edge-logging",
+    "correlation-id",
+    "async-logger",
+    "non-blocking-logger",
+    "fast-logger",
+    "high-performance-logging",
+    "log-management",
+    "structured-logs",
+    "json-logger",
+    "typescript-logging",
+    "bunyan-alternative"
+  ],
+  "author": {
+    "name": "Sanjeev Sharma",
+    "email": "webcoderspeed@gmail.com",
+    "url": "https://github.com/webcoderspeed"
+  },
+  "license": "MIT",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Logixia/logixia.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Logixia/logixia/issues"
+  },
+  "homepage": "https://logixia.github.io/logixia/",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/webcoderspeed"
+    },
+    {
+      "type": "paypal",
+      "url": "https://paypal.me/Sniperspeed"
+    }
+  ],
+  "peerDependencies": {
+    "@nestjs/common": "^10.0.0 || ^11.0.0",
+    "express": "^4.0.0 || ^5.0.0",
+    "reflect-metadata": "^0.1.13 || ^0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/common": {
+      "optional": true
+    },
+    "express": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
+    "@commitlint/types": "^21.2.3",
+    "@eslint/js": "^10.0.1",
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.1.17",
+    "@nestjs/microservices": "^11.1.17",
+    "@nestjs/platform-express": "^11.1.17",
+    "@nestjs/platform-socket.io": "^11.1.17",
+    "@nestjs/websockets": "^11.1.17",
+    "@size-limit/file": "^12.0.1",
+    "@types/express": "^4.17.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.15.5",
+    "@types/pino": "^7.0.4",
+    "@types/uuid": "^9.0.0",
+    "conventional-changelog-conventionalcommits": "^8.0.0",
+    "eslint": "^10.0.3",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-simple-import-sort": "^12.1.1",
+    "eslint-plugin-sonarjs": "4.2.0",
+    "eslint-plugin-unicorn": "^63.0.0",
+    "express": "^5.2.1",
+    "globals": "^17.4.0",
+    "husky": "^9.1.7",
+    "jest": "^30.3.0",
+    "kafkajs": "^2.2.4",
+    "lint-staged": "^17.6.0",
+    "mongodb": "^7.7.0",
+    "mysql2": "^3.14.5",
+    "pg": "^8.16.3",
+    "pino": "^10.3.1",
+    "prettier": "^3.8.1",
+    "reflect-metadata": "^0.2.2",
+    "size-limit": "^12.0.1",
+    "socket.io": "^4.8.3",
+    "tinybench": "^6.0.0",
+    "ts-jest": "^29.0.0",
+    "ts-node": "^10.9.2",
+    "tsdown": "^0.15.0",
+    "typescript": "^5.0.0",
+    "typescript-eslint": "^8.57.0",
+    "uuid": "^9.0.0",
+    "winston": "^3.19.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "bin": {
+    "logixia": "./dist/cli/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "commander": "^11.1.0",
+    "fast-json-stringify": "^7.0.1",
+    "picocolors": "^1.1.1"
+  },
+  "overrides": {
+    "lodash": "^4.18.1",
+    "brace-expansion": "^5.0.5",
+    "picomatch": "^4.0.4",
+    "npm": {
+      "brace-expansion": "^5.0.5",
+      "picomatch": "^4.0.4"
+    }
+  },
+  "lint-staged": {
+    "src/**/*.{ts,js}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,yml,yaml,mjs,cjs}": [
+      "prettier --write"
+    ]
+  },
+  "size-limit": [
+    {
+      "name": "ESM (gzipped)",
+      "path": "dist/index.mjs",
+      "limit": "200 KB",
+      "brotli": false,
+      "gzip": true
+    },
+    {
+      "name": "CJS (gzipped)",
+      "path": "dist/index.js",
+      "limit": "200 KB",
+      "brotli": false,
+      "gzip": true
+    }
+  ]
+}

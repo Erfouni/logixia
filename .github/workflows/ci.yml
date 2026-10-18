@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# PRs: cancel the old run when you push more changes (saves CI minutes).
+# main / develop pushes: never cancel — the release job lives inside this run,
+# so cancelling it mid-flight would abort a release in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # 1. Quality — auto-fix → lint · typecheck
+  #
+  # Strategy:
+  #   a) Auto-fix  — run format + lint:fix so trivial style drift never
+  #                  blocks a PR.
+  #   b) Commit-back — ONLY on pull_request events (not on push to main).
+  #                  Committing back on a direct push to main would advance
+  #                  origin/main PAST github.sha, causing the release job's
+  #                  checkout to be stale → semantic-release "local branch
+  #                  is behind remote" → skipped release.
+  #                  On fork PRs the commit step gracefully no-ops anyway
+  #                  (no write access to forks).
+  #   c) Hard gate — lint:check catches errors that can't be auto-fixed
+  #                  (real code issues), typecheck catches type errors.
+  #                  These still fail the build as intended.
+  # ─────────────────────────────────────────────────────────
+  quality:
+    name: Quality (lint · typecheck · format)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          # No cache: package-lock.json is intentionally excluded from the repo
+          # (library project; lockfile causes CI failures across ARM/x64 platforms
+          # due to platform-specific rolldown native bindings).
+
+      - name: Install dependencies
+        run: npm install
+
+      # Check only, never commit back: a bot commit wouldn't trigger CI, so
+      # required checks would never report on it. Fix locally with
+      # `npm run format && npm run lint:fix`.
+      - name: Format
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint:check
+
+      - name: Type check
+        run: npm run typecheck
+
+  # ─────────────────────────────────────────────────────────
+  # 2. Tests — Node 18 / 20 / 22 matrix
+  # (logixia uses jest, so Node 18 is still supported)
+  # ─────────────────────────────────────────────────────────
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18', '20', '22']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage to Codecov
+        if: matrix.node-version == '22'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # ─────────────────────────────────────────────────────────
+  # 3. Build — verify dist is producible
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify dist artifacts
+        run: |
+          test -f dist/index.js  || (echo "dist/index.js missing"  && exit 1)
+          test -f dist/index.mjs || (echo "dist/index.mjs missing" && exit 1)
+          # tsdown emits .d.ts for CJS-primary packages, .d.mts for ESM-primary;
+          # accept either so the check stays green regardless of future tsdown behaviour.
+          (test -f dist/index.d.ts || test -f dist/index.d.mts) \
+            || (echo "dist/index.d.ts (or .d.mts) missing" && exit 1)
+          echo "All dist artifacts present"
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  # ─────────────────────────────────────────────────────────
+  # 4. Release — only on direct push to main
+  #
+  # Why "local branch is behind remote" used to happen so often:
+  #
+  #   semantic-release checks that local HEAD == origin HEAD before it
+  #   will publish.  Any commit pushed to main AFTER github.sha (the SHA
+  #   this run was triggered by) but BEFORE the release step executes
+  #   causes the check to fail.  Sources include:
+  #     • bot/dependabot commits
+  #     • concurrent CI runs from quick successive pushes
+  #   The "Sync with remote" step below eliminates all of these by
+  #   fast-forwarding local to the current tip of origin/main right
+  #   before semantic-release runs.  semantic-release then sees
+  #   local == remote and proceeds normally.
+  # ─────────────────────────────────────────────────────────
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write # push release tag + chore(release) commit
+      issues: write # comment on released issues
+      pull-requests: write # comment on released PRs
+      id-token: write # npm provenance attestation
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Fast-forward local main to the current tip of origin/main.
+      # Eliminates "local branch is behind the remote" skips caused by
+      # any commit pushed to main after github.sha was captured.
+      - name: Sync with remote
+        run: git fetch origin && git reset --hard origin/main
+
+      - name: Install dependencies
+        env:
+          HUSKY: 0 # skip husky install in CI — no local git hooks needed
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No NPM_TOKEN — npm publish uses OIDC trusted publishing.
+          # @semantic-release/npm auto-detects the GitHub Actions OIDC token
+          # when id-token: write is granted (see permissions above) and no
+          # NPM_TOKEN is set, so no secret is needed. Requires a trusted
+          # publisher to be configured for this package on npmjs.com.
+          NPM_CONFIG_PROVENANCE: true
+          HUSKY: 0 # skip commit-msg / pre-commit hooks on the auto-generated release commit
+        run: npx --yes -p semantic-release@25 -p conventional-changelog-conventionalcommits@8 semantic-release
